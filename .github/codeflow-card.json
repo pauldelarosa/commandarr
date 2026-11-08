@@ -98,6 +98,104 @@
           "total": 652
         }
       ]
+    },
+    {
+      "at": "2026-11-08T02:54:37.758Z",
+      "sha": "1b836592f368f69096966aabd0bcf80ed9cdbbab",
+      "pr": null,
+      "actor": "pauldelarosa",
+      "files": 452,
+      "functions": 939,
+      "loc": 60068,
+      "languages": 13,
+      "topLanguages": [
+        {
+          "ext": "ts",
+          "pct": 68,
+          "lines": 40821
+        },
+        {
+          "ext": "json",
+          "pct": 14,
+          "lines": 8412
+        },
+        {
+          "ext": "tsx",
+          "pct": 12,
+          "lines": 7339
+        },
+        {
+          "ext": "md",
+          "pct": 2,
+          "lines": 1252
+        },
+        {
+          "ext": "lock",
+          "pct": 2,
+          "lines": 1066
+        }
+      ],
+      "dead": 111,
+      "deadPct": 11.8,
+      "circular": 1,
+      "godObjects": 1,
+      "avgCoupling": 2.1,
+      "securityIssues": 23,
+      "patterns": 7,
+      "duplicates": 34,
+      "layerViolations": 39,
+      "connections": 957,
+      "avgFnLines": 14.9,
+      "longestFn": 16,
+      "testFiles": 0,
+      "testRatio": 0,
+      "topFolders": [
+        {
+          "name": "src",
+          "count": 391
+        },
+        {
+          "name": "web",
+          "count": 47
+        },
+        {
+          "name": "root",
+          "count": 11
+        },
+        {
+          "name": "helper",
+          "count": 3
+        }
+      ],
+      "folders": 4,
+      "grade": "D",
+      "score": 60,
+      "topBlast": {
+        "path": "web/index.html",
+        "direct": 358,
+        "transitive": 383,
+        "total": 741
+      },
+      "fragility": [
+        {
+          "path": "web/index.html",
+          "direct": 358,
+          "transitive": 383,
+          "total": 741
+        },
+        {
+          "path": "src/utils/logger.ts",
+          "direct": 283,
+          "transitive": 361,
+          "total": 644
+        },
+        {
+          "path": "src/routes/ws.ts",
+          "direct": 26,
+          "transitive": 364,
+          "total": 390
+        }
+      ]
     }
   ]
 }
