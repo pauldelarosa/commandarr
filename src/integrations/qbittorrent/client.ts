@@ -29,7 +29,7 @@ async function authenticate(baseUrl: string, username: string, password: string)
 
   // Extract SID cookie from Set-Cookie header
   const setCookie = response.headers.get('set-cookie') ?? '';
-  const sidMatch = setCookie.match(/SID=([^;]+)/);
+  const sidMatch = setCookie.match(/((?:QBT_)?SID(?:_\d+)?=[^;]+)/);
   if (!sidMatch) {
     throw new Error('qBittorrent authentication failed: no SID cookie returned');
   }
@@ -48,7 +48,7 @@ async function qbFetch(
   const url = new URL(path, baseUrl);
 
   const headers: Record<string, string> = {
-    Cookie: `SID=${sid}`,
+    Cookie: sid,
   };
 
   if (body && contentType) {
