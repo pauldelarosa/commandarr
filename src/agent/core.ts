@@ -154,6 +154,7 @@ export async function* processMessage(
 
   let toolRounds = 0;
   let currentMessages = messagesForLLM;
+  let lastToolResults: Array<{ name: string; result: Awaited<ReturnType<typeof executeTool>> }> = [];
 
   while (toolRounds < MAX_TOOL_ROUNDS) {
     // Accumulate the full assistant response across the stream
@@ -191,8 +192,56 @@ export async function* processMessage(
       return;
     }
 
-    // If no tool calls were made, we're done
+    // If no tool calls were made, we're done (guard against silent empty synthesis)
     if (toolCalls.length === 0) {
+      if (!assistantText.trim()) {
+        if (toolRounds > 0) {
+          logger.warn('agent', `Empty follow-up response after ${toolRounds} tool round(s); retrying synthesis`);
+          const retryMessages: Message[] = [
+            ...currentMessages,
+            { role: 'user', content: 'Please summarize the tool results above concisely for the user.' },
+          ];
+          try {
+            const retryStream = router.chatWithFallback(
+              retryMessages,
+              llmTools.length > 0 ? llmTools : undefined,
+            );
+            for await (const chunk of retryStream) {
+              if (chunk.type === 'text' && chunk.text) {
+                assistantText += chunk.text;
+                yield chunk;
+              } else if (chunk.type === 'done') {
+                lastUsage = chunk.usage || lastUsage;
+              } else if (chunk.type === 'error') {
+                logger.warn('agent', 'Synthesis retry error', chunk.error);
+                break;
+              }
+            }
+          } catch (retryErr: any) {
+            logger.warn('agent', `Synthesis retry threw: ${retryErr.message}`);
+          }
+
+          if (!assistantText.trim()) {
+            const fallbackSummary = lastToolResults
+              .map((entry) => entry.result?.message || JSON.stringify(entry.result))
+              .filter(Boolean)
+              .join('\n\n');
+            assistantText =
+              fallbackSummary ||
+              'The requested tool finished executing, but the model returned an empty response.';
+            yield { type: 'text', text: assistantText };
+          }
+        } else {
+          logger.warn('agent', 'Model returned an empty response with no tool calls');
+          yield {
+            type: 'error',
+            error: 'The model returned an empty response. Please try again.',
+          };
+          await saveConversation(conv);
+          return;
+        }
+      }
+
       conv.messages.push({ role: 'assistant', content: assistantText });
       await saveConversation(conv);
       await logChat(conversationId, platform, 'assistant', assistantText);
@@ -202,18 +251,27 @@ export async function* processMessage(
 
     // --- Tool call round ---
     toolRounds++;
+    lastToolResults = [];
+
+    const normalizedToolCalls: ToolCall[] = toolCalls.map((tc) => ({
+      ...tc,
+      function: {
+        ...tc.function,
+        arguments: tc.function.arguments?.trim() ? tc.function.arguments : '{}',
+      },
+    }));
 
     // Add the assistant message with tool calls to history
     const assistantMsg: Message = {
       role: 'assistant',
       content: assistantText || '',
-      tool_calls: toolCalls,
+      tool_calls: normalizedToolCalls,
     };
     conv.messages.push(assistantMsg);
     currentMessages.push(assistantMsg);
 
     // Execute each tool call and add results
-    for (const tc of toolCalls) {
+    for (const tc of normalizedToolCalls) {
       let params: Record<string, any>;
       try {
         params = JSON.parse(tc.function.arguments);
@@ -224,6 +282,7 @@ export async function* processMessage(
       logger.info('agent', `Calling tool: ${tc.function.name}`, params);
 
       const result = await executeTool(tc.function.name, params);
+      lastToolResults.push({ name: tc.function.name, result });
 
       const toolResultMsg: Message = {
         role: 'tool',
@@ -290,9 +349,12 @@ function buildLLMMessages(systemPrompt: string, conversationMessages: Message[])
   // Filter out any previous system messages from stored history
   const history = conversationMessages.filter((m) => m.role !== 'system');
 
-  // Keep a reasonable window of history (last 50 messages)
+  // Keep a reasonable window of history (last 50 messages) without orphaning tool results
   const maxHistory = 50;
-  const trimmed = history.length > maxHistory ? history.slice(-maxHistory) : history;
+  const trimmed = history.length > maxHistory ? history.slice(-maxHistory) : [...history];
+  while (trimmed.length > 0 && trimmed[0].role === 'tool') {
+    trimmed.shift();
+  }
 
   return [systemMsg, ...trimmed];
 }

@@ -1,13 +1,59 @@
-import type { LLMProvider, ConfigField, Model, Message, ToolDef, StreamChunk, ToolCall, ChatOptions } from '../provider';
+import type { LLMProvider, ConfigField, Model, Message, ToolDef, StreamChunk, ChatOptions } from '../provider';
+import { nanoid } from 'nanoid';
+
+const DEFAULT_LLM_TIMEOUT_MS = 120_000;
+
+function normalizeToolArgs(rawArgs?: string): string {
+  const trimmed = rawArgs?.trim();
+  return trimmed ? trimmed : '{}';
+}
+
+/**
+ * Format internal messages into standard OpenAI chat completion payloads.
+ */
+export function formatOpenAIMessages(messages: Message[]): Record<string, unknown>[] {
+  return messages.map((m) => {
+    const msg: Record<string, unknown> = { role: m.role, content: m.content };
+    if (m.name) msg.name = m.name;
+    if (m.tool_calls && m.tool_calls.length > 0) {
+      msg.tool_calls = m.tool_calls.map((tc) => ({
+        id: tc.id,
+        type: tc.type,
+        function: {
+          name: tc.function.name,
+          arguments: normalizeToolArgs(tc.function.arguments),
+        },
+      }));
+    }
+    if (m.tool_call_id) msg.tool_call_id = m.tool_call_id;
+    return msg;
+  });
+}
 
 /**
  * Parse an SSE stream from an OpenAI-compatible API response.
  * Yields parsed JSON objects for each `data:` line (except `[DONE]`).
  */
 async function* parseSSE(response: Response): AsyncGenerator<any> {
-  const reader = response.body!.getReader();
+  if (!response.body) return;
+  const reader = response.body.getReader();
   const decoder = new TextDecoder();
   let buffer = '';
+
+  const parseLine = (line: string): { done: boolean; value?: any } => {
+    const trimmed = line.trim();
+    if (!trimmed || trimmed.startsWith(':')) return { done: false };
+    if (trimmed.startsWith('data:')) {
+      const data = trimmed.slice(5).trimStart();
+      if (data === '[DONE]') return { done: true };
+      try {
+        return { done: false, value: JSON.parse(data) };
+      } catch {
+        // skip unparseable lines
+      }
+    }
+    return { done: false };
+  };
 
   try {
     while (true) {
@@ -19,22 +65,118 @@ async function* parseSSE(response: Response): AsyncGenerator<any> {
       buffer = lines.pop() || '';
 
       for (const line of lines) {
-        const trimmed = line.trim();
-        if (!trimmed || trimmed.startsWith(':')) continue;
-        if (trimmed.startsWith('data: ')) {
-          const data = trimmed.slice(6);
-          if (data === '[DONE]') return;
-          try {
-            yield JSON.parse(data);
-          } catch {
-            // skip unparseable lines
-          }
-        }
+        const parsed = parseLine(line);
+        if (parsed.done) return;
+        if (parsed.value !== undefined) yield parsed.value;
+      }
+    }
+
+    buffer += decoder.decode();
+    if (buffer.trim()) {
+      for (const line of buffer.split('\n')) {
+        const parsed = parseLine(line);
+        if (parsed.done) return;
+        if (parsed.value !== undefined) yield parsed.value;
       }
     }
   } finally {
     reader.releaseLock();
   }
+}
+
+/**
+ * Consume an OpenAI-compatible SSE stream and yield normalized StreamChunks.
+ */
+export async function* streamOpenAICompatibleChat(
+  response: Response,
+  providerLabel: string,
+): AsyncGenerator<StreamChunk> {
+  const pendingToolCalls = new Map<number, { id: string; name: string; arguments: string }>();
+  let usage: StreamChunk['usage'] | undefined;
+
+  for await (const chunk of parseSSE(response)) {
+    if (chunk.error) {
+      const errMsg = typeof chunk.error === 'string'
+        ? chunk.error
+        : chunk.error?.message || JSON.stringify(chunk.error);
+      yield { type: 'error', error: `${providerLabel} stream error: ${errMsg}` };
+      return;
+    }
+
+    if (chunk.usage) {
+      usage = {
+        promptTokens: chunk.usage.prompt_tokens || 0,
+        completionTokens: chunk.usage.completion_tokens || 0,
+      };
+    }
+
+    const choice = chunk.choices?.[0];
+    if (!choice) continue;
+
+    const delta = choice.delta;
+    if (delta) {
+      if (delta.content) {
+        yield { type: 'text', text: delta.content };
+      }
+
+      if (delta.tool_calls) {
+        for (const tc of delta.tool_calls) {
+          const idx = tc.index ?? 0;
+          const existing = pendingToolCalls.get(idx);
+          if (!existing) {
+            pendingToolCalls.set(idx, {
+              id: tc.id || `call_${nanoid(10)}`,
+              name: tc.function?.name || '',
+              arguments: tc.function?.arguments || '',
+            });
+          } else {
+            if (tc.id && !existing.id) existing.id = tc.id;
+            if (tc.function?.name) existing.name += tc.function.name;
+            if (tc.function?.arguments) existing.arguments += tc.function.arguments;
+          }
+        }
+      }
+    }
+
+    const finishReason = choice.finish_reason;
+    if (finishReason === 'content_filter') {
+      yield { type: 'error', error: `${providerLabel} response was filtered by content policy.` };
+      return;
+    }
+
+    if (
+      finishReason === 'tool_calls' ||
+      finishReason === 'stop' ||
+      finishReason === 'length' ||
+      finishReason === 'function_call'
+    ) {
+      for (const [, tc] of pendingToolCalls) {
+        yield {
+          type: 'tool_call',
+          toolCall: {
+            id: tc.id,
+            type: 'function',
+            function: { name: tc.name, arguments: normalizeToolArgs(tc.arguments) },
+          },
+        };
+      }
+      pendingToolCalls.clear();
+    }
+  }
+
+  // Flush any tool calls if stream ended without a finish_reason chunk
+  for (const [, tc] of pendingToolCalls) {
+    yield {
+      type: 'tool_call',
+      toolCall: {
+        id: tc.id,
+        type: 'function',
+        function: { name: tc.name, arguments: normalizeToolArgs(tc.arguments) },
+      },
+    };
+  }
+
+  yield { type: 'done', usage };
 }
 
 export class OpenAIProvider implements LLMProvider {
@@ -107,13 +249,7 @@ export class OpenAIProvider implements LLMProvider {
     const body: Record<string, unknown> = {
       model: this.model,
       max_tokens: options?.maxTokens ?? 4096,
-      messages: messages.map((m) => {
-        const msg: Record<string, unknown> = { role: m.role, content: m.content };
-        if (m.name) msg.name = m.name;
-        if (m.tool_calls) msg.tool_calls = m.tool_calls;
-        if (m.tool_call_id) msg.tool_call_id = m.tool_call_id;
-        return msg;
-      }),
+      messages: formatOpenAIMessages(messages),
       stream: true,
     };
     if (options?.temperature !== undefined) body.temperature = options.temperature;
@@ -125,6 +261,7 @@ export class OpenAIProvider implements LLMProvider {
         method: 'POST',
         headers,
         body: JSON.stringify(body),
+        signal: AbortSignal.timeout(DEFAULT_LLM_TIMEOUT_MS),
       });
     } catch (err: any) {
       yield { type: 'error', error: `OpenAI request failed: ${err.message}` };
@@ -137,68 +274,7 @@ export class OpenAIProvider implements LLMProvider {
       return;
     }
 
-    const pendingToolCalls = new Map<number, { id: string; name: string; arguments: string }>();
-
-    for await (const chunk of parseSSE(response)) {
-      const delta = chunk.choices?.[0]?.delta;
-      if (!delta) {
-        // Check for usage in the final chunk
-        if (chunk.usage) {
-          yield {
-            type: 'done',
-            usage: {
-              promptTokens: chunk.usage.prompt_tokens || 0,
-              completionTokens: chunk.usage.completion_tokens || 0,
-            },
-          };
-        }
-        continue;
-      }
-
-      // Text content
-      if (delta.content) {
-        yield { type: 'text', text: delta.content };
-      }
-
-      // Tool calls (streamed incrementally)
-      if (delta.tool_calls) {
-        for (const tc of delta.tool_calls) {
-          const idx = tc.index ?? 0;
-          if (tc.id) {
-            pendingToolCalls.set(idx, {
-              id: tc.id,
-              name: tc.function?.name || '',
-              arguments: tc.function?.arguments || '',
-            });
-          } else {
-            const existing = pendingToolCalls.get(idx);
-            if (existing) {
-              if (tc.function?.name) existing.name += tc.function.name;
-              if (tc.function?.arguments) existing.arguments += tc.function.arguments;
-            }
-          }
-        }
-      }
-
-      // Check if this choice is finished
-      const finishReason = chunk.choices?.[0]?.finish_reason;
-      if (finishReason === 'tool_calls' || finishReason === 'stop') {
-        // Emit completed tool calls
-        for (const [, tc] of pendingToolCalls) {
-          yield {
-            type: 'tool_call',
-            toolCall: {
-              id: tc.id,
-              type: 'function',
-              function: { name: tc.name, arguments: tc.arguments },
-            },
-          };
-        }
-        pendingToolCalls.clear();
-      }
-    }
-
-    yield { type: 'done' };
+    yield* streamOpenAICompatibleChat(response, 'OpenAI');
   }
 
   async listModels(): Promise<Model[]> {

@@ -31,6 +31,7 @@ export interface ToolCall {
     name: string;
     arguments: string;
   };
+  thoughtSignature?: string;
 }
 
 export interface ToolDef {

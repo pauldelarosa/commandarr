@@ -1,8 +1,10 @@
 import type { LLMProvider, Model, Message, ToolDef, StreamChunk, ChatOptions } from '../provider';
+import { nanoid } from 'nanoid';
 
 interface OllamaMessage {
   role: 'system' | 'user' | 'assistant' | 'tool';
   content: string;
+  tool_name?: string;
   tool_calls?: Array<{
     function: { name: string; arguments: Record<string, unknown> };
   }>;
@@ -56,11 +58,14 @@ export class OllamaProvider implements LLMProvider {
   async *chat(messages: Message[], tools?: ToolDef[], options?: ChatOptions): AsyncGenerator<StreamChunk> {
     const ollamaMessages: OllamaMessage[] = messages.map((m) => {
       const msg: OllamaMessage = { role: m.role, content: m.content };
+      if (m.role === 'tool' && m.name) {
+        msg.tool_name = m.name;
+      }
       if (m.tool_calls) {
         msg.tool_calls = m.tool_calls.map((tc) => {
           let args: Record<string, unknown> = {};
           try {
-            args = JSON.parse(tc.function.arguments);
+            args = JSON.parse(tc.function.arguments || '{}');
           } catch {
             // keep empty
           }
@@ -92,6 +97,7 @@ export class OllamaProvider implements LLMProvider {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify(body),
+        signal: AbortSignal.timeout(120_000),
       });
     } catch (err: any) {
       yield {
@@ -113,7 +119,54 @@ export class OllamaProvider implements LLMProvider {
     let buffer = '';
     let promptTokens = 0;
     let completionTokens = 0;
-    let toolCallCounter = 0;
+
+    const processLine = function* (line: string): Generator<StreamChunk | { __stopError?: boolean }> {
+      const trimmed = line.trim();
+      if (!trimmed) return;
+
+      let parsed: any;
+      try {
+        parsed = JSON.parse(trimmed);
+      } catch {
+        return;
+      }
+
+      if (parsed.error) {
+        yield { type: 'error', error: `Ollama error: ${parsed.error}` };
+        yield { __stopError: true };
+        return;
+      }
+
+      // Ollama streams message content in message.content
+      if (parsed.message) {
+        if (parsed.message.content) {
+          yield { type: 'text', text: parsed.message.content };
+        }
+
+        // Tool calls from Ollama
+        if (parsed.message.tool_calls) {
+          for (const tc of parsed.message.tool_calls) {
+            yield {
+              type: 'tool_call',
+              toolCall: {
+                id: `call_ollama_${nanoid(10)}`,
+                type: 'function',
+                function: {
+                  name: tc.function.name,
+                  arguments: JSON.stringify(tc.function.arguments || {}),
+                },
+              },
+            };
+          }
+        }
+      }
+
+      // When done is true, collect usage stats
+      if (parsed.done) {
+        promptTokens = parsed.prompt_eval_count || 0;
+        completionTokens = parsed.eval_count || 0;
+      }
+    };
 
     try {
       while (true) {
@@ -125,45 +178,19 @@ export class OllamaProvider implements LLMProvider {
         buffer = lines.pop() || '';
 
         for (const line of lines) {
-          const trimmed = line.trim();
-          if (!trimmed) continue;
-
-          let parsed: any;
-          try {
-            parsed = JSON.parse(trimmed);
-          } catch {
-            continue;
+          for (const out of processLine(line)) {
+            if ('__stopError' in out) return;
+            yield out;
           }
+        }
+      }
 
-          // Ollama streams message content in message.content
-          if (parsed.message) {
-            if (parsed.message.content) {
-              yield { type: 'text', text: parsed.message.content };
-            }
-
-            // Tool calls from Ollama
-            if (parsed.message.tool_calls) {
-              for (const tc of parsed.message.tool_calls) {
-                toolCallCounter++;
-                yield {
-                  type: 'tool_call',
-                  toolCall: {
-                    id: `call_ollama_${toolCallCounter}`,
-                    type: 'function',
-                    function: {
-                      name: tc.function.name,
-                      arguments: JSON.stringify(tc.function.arguments || {}),
-                    },
-                  },
-                };
-              }
-            }
-          }
-
-          // When done is true, collect usage stats
-          if (parsed.done) {
-            promptTokens = parsed.prompt_eval_count || 0;
-            completionTokens = parsed.eval_count || 0;
+      buffer += decoder.decode();
+      if (buffer.trim()) {
+        for (const line of buffer.split('\n')) {
+          for (const out of processLine(line)) {
+            if ('__stopError' in out) return;
+            yield out;
           }
         }
       }

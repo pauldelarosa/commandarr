@@ -1,4 +1,5 @@
 import type { LLMProvider, Model, Message, ToolDef, StreamChunk, ChatOptions } from '../provider';
+import { nanoid } from 'nanoid';
 
 interface GeminiContent {
   role: 'user' | 'model';
@@ -6,8 +7,8 @@ interface GeminiContent {
 }
 
 type GeminiPart =
-  | { text: string }
-  | { functionCall: { name: string; args: Record<string, unknown> } }
+  | { text: string; thought?: boolean }
+  | { functionCall: { name: string; args: Record<string, unknown> }; thoughtSignature?: string }
   | { functionResponse: { name: string; response: { result: unknown } } };
 
 interface GeminiToolDeclaration {
@@ -74,24 +75,29 @@ export class GoogleProvider implements LLMProvider {
       }
 
       if (msg.role === 'tool') {
-        // Tool response goes as a user message with functionResponse part
+        // Tool response goes as a user message with functionResponse part.
+        // Merge consecutive tool responses into one user message for parallel calls.
         let result: unknown;
         try {
           result = JSON.parse(msg.content);
         } catch {
           result = msg.content;
         }
-        contents.push({
-          role: 'user',
-          parts: [
-            {
-              functionResponse: {
-                name: msg.name || 'unknown',
-                response: { result },
-              },
-            },
-          ],
-        });
+        const responsePart: GeminiPart = {
+          functionResponse: {
+            name: msg.name || 'unknown',
+            response: { result },
+          },
+        };
+        const last = contents[contents.length - 1];
+        if (last && last.role === 'user' && last.parts.some((p) => 'functionResponse' in p)) {
+          last.parts.push(responsePart);
+        } else {
+          contents.push({
+            role: 'user',
+            parts: [responsePart],
+          });
+        }
         continue;
       }
 
@@ -104,13 +110,17 @@ export class GoogleProvider implements LLMProvider {
           for (const tc of msg.tool_calls) {
             let args: Record<string, unknown> = {};
             try {
-              args = JSON.parse(tc.function.arguments);
+              args = JSON.parse(tc.function.arguments || '{}');
             } catch {
               // keep empty
             }
-            parts.push({
+            const fcPart: GeminiPart = {
               functionCall: { name: tc.function.name, args },
-            });
+            };
+            if (tc.thoughtSignature) {
+              fcPart.thoughtSignature = tc.thoughtSignature;
+            }
+            parts.push(fcPart);
           }
         }
         if (parts.length > 0) {
@@ -173,6 +183,7 @@ export class GoogleProvider implements LLMProvider {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify(body),
+        signal: AbortSignal.timeout(120_000),
       });
     } catch (err: any) {
       yield { type: 'error', error: `Google API request failed: ${err.message}` };
@@ -191,7 +202,69 @@ export class GoogleProvider implements LLMProvider {
     let buffer = '';
     let promptTokens = 0;
     let completionTokens = 0;
-    let toolCallCounter = 0;
+    let hasEmittedContent = false;
+    let lastFinishReason: string | undefined;
+
+    const processLine = function* (line: string): Generator<StreamChunk | { __stopError?: boolean }> {
+      const trimmed = line.trim();
+      if (!trimmed || trimmed.startsWith(':')) return;
+      if (!trimmed.startsWith('data:')) return;
+
+      const data = trimmed.slice(5).trimStart();
+      let parsed: any;
+      try {
+        parsed = JSON.parse(data);
+      } catch {
+        return;
+      }
+
+      if (parsed.error) {
+        yield {
+          type: 'error',
+          error: `Google API stream error: ${parsed.error.message || JSON.stringify(parsed.error)}`,
+        };
+        yield { __stopError: true };
+        return;
+      }
+
+      // Process candidates
+      const candidates = parsed.candidates;
+      if (candidates && candidates.length > 0) {
+        if (candidates[0].finishReason) {
+          lastFinishReason = candidates[0].finishReason;
+        }
+        const content = candidates[0].content;
+        if (content?.parts) {
+          for (const part of content.parts) {
+            if (part.text && !part.thought) {
+              hasEmittedContent = true;
+              yield { type: 'text', text: part.text };
+            }
+            if (part.functionCall) {
+              hasEmittedContent = true;
+              yield {
+                type: 'tool_call',
+                toolCall: {
+                  id: `call_gemini_${nanoid(10)}`,
+                  type: 'function',
+                  function: {
+                    name: part.functionCall.name,
+                    arguments: JSON.stringify(part.functionCall.args || {}),
+                  },
+                  ...(part.thoughtSignature ? { thoughtSignature: part.thoughtSignature } : {}),
+                },
+              };
+            }
+          }
+        }
+      }
+
+      // Usage metadata
+      if (parsed.usageMetadata) {
+        promptTokens = parsed.usageMetadata.promptTokenCount || 0;
+        completionTokens = parsed.usageMetadata.candidatesTokenCount || 0;
+      }
+    };
 
     try {
       while (true) {
@@ -203,55 +276,32 @@ export class GoogleProvider implements LLMProvider {
         buffer = lines.pop() || '';
 
         for (const line of lines) {
-          const trimmed = line.trim();
-          if (!trimmed || trimmed.startsWith(':')) continue;
+          for (const out of processLine(line)) {
+            if ('__stopError' in out) return;
+            yield out;
+          }
+        }
+      }
 
-          if (trimmed.startsWith('data: ')) {
-            const data = trimmed.slice(6);
-            let parsed: any;
-            try {
-              parsed = JSON.parse(data);
-            } catch {
-              continue;
-            }
-
-            // Process candidates
-            const candidates = parsed.candidates;
-            if (candidates && candidates.length > 0) {
-              const content = candidates[0].content;
-              if (content?.parts) {
-                for (const part of content.parts) {
-                  if (part.text) {
-                    yield { type: 'text', text: part.text };
-                  }
-                  if (part.functionCall) {
-                    toolCallCounter++;
-                    yield {
-                      type: 'tool_call',
-                      toolCall: {
-                        id: `call_gemini_${toolCallCounter}`,
-                        type: 'function',
-                        function: {
-                          name: part.functionCall.name,
-                          arguments: JSON.stringify(part.functionCall.args || {}),
-                        },
-                      },
-                    };
-                  }
-                }
-              }
-            }
-
-            // Usage metadata
-            if (parsed.usageMetadata) {
-              promptTokens = parsed.usageMetadata.promptTokenCount || 0;
-              completionTokens = parsed.usageMetadata.candidatesTokenCount || 0;
-            }
+      buffer += decoder.decode();
+      if (buffer.trim()) {
+        for (const line of buffer.split('\n')) {
+          for (const out of processLine(line)) {
+            if ('__stopError' in out) return;
+            yield out;
           }
         }
       }
     } finally {
       reader.releaseLock();
+    }
+
+    if (!hasEmittedContent && lastFinishReason && lastFinishReason !== 'STOP') {
+      yield {
+        type: 'error',
+        error: `Google Gemini stopped without output (${lastFinishReason})`,
+      };
+      return;
     }
 
     yield { type: 'done', usage: { promptTokens, completionTokens } };

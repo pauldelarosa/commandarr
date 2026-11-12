@@ -387,6 +387,7 @@ function createChatModelAdapter(
       const contentParts: Array<{ type: 'text'; text: string } | ToolCallPart> = [];
       let toolCallCounter = 0;
       let done = false;
+      let receivedTerminal = false;
       let error: string | null = null;
 
       const queue: QueueItem[] = [];
@@ -444,12 +445,16 @@ function createChatModelAdapter(
             const item = queue.shift()!;
 
             if (item.kind === 'close') {
+              if (!receivedTerminal && !abortSignal.aborted && !error) {
+                error = 'WebSocket closed before the response completed.';
+              }
               done = true;
               break;
             }
 
             if (item.kind === 'error') {
               error = item.error;
+              receivedTerminal = true;
               done = true;
               break;
             }
@@ -485,7 +490,12 @@ function createChatModelAdapter(
                 const textStr = data.text as string;
                 try {
                   tcResult = JSON.parse(textStr);
-                  tcIsError = textStr.startsWith('Error');
+                  tcIsError =
+                    textStr.startsWith('Error') ||
+                    (typeof tcResult === 'object' &&
+                      tcResult !== null &&
+                      'success' in tcResult &&
+                      (tcResult as { success?: unknown }).success === false);
                 } catch {
                   tcResult = textStr;
                   tcIsError = textStr.startsWith('Error');
@@ -524,13 +534,23 @@ function createChatModelAdapter(
                 });
               }
             } else if (data.type === 'done') {
+              receivedTerminal = true;
               done = true;
               onDone();
               break;
             } else if (data.type === 'error') {
-              error = data.error as string;
+              error = (data.error as string) || 'Unknown error';
+              receivedTerminal = true;
               done = true;
               break;
+            }
+          }
+
+          if (error && contentParts.length > 0) {
+            const lastPart = contentParts[contentParts.length - 1];
+            const errNote = `Error: ${error}`;
+            if (!(lastPart.type === 'text' && lastPart.text.includes(errNote))) {
+              contentParts.push({ type: 'text', text: errNote });
             }
           }
 

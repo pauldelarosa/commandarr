@@ -79,17 +79,20 @@ export class AnthropicProvider implements LLMProvider {
       }
 
       if (msg.role === 'tool') {
-        // Tool results in Anthropic are sent as user messages with tool_result content blocks
-        converted.push({
-          role: 'user',
-          content: [
-            {
-              type: 'tool_result',
-              tool_use_id: msg.tool_call_id,
-              content: msg.content,
-            },
-          ],
-        });
+        // Tool results in Anthropic are sent as user messages with tool_result content blocks.
+        // Merge consecutive tool results into a single user message to satisfy Anthropic's
+        // strict alternating user/assistant turn requirement.
+        const block = {
+          type: 'tool_result',
+          tool_use_id: msg.tool_call_id,
+          content: msg.content,
+        };
+        const last = converted[converted.length - 1];
+        if (last && last.role === 'user' && Array.isArray(last.content)) {
+          last.content.push(block);
+        } else {
+          converted.push({ role: 'user', content: [block] });
+        }
         continue;
       }
 
@@ -102,7 +105,7 @@ export class AnthropicProvider implements LLMProvider {
         for (const tc of msg.tool_calls) {
           let input: Record<string, unknown> = {};
           try {
-            input = JSON.parse(tc.function.arguments);
+            input = JSON.parse(tc.function.arguments || '{}');
           } catch {
             // keep empty object
           }
@@ -122,8 +125,14 @@ export class AnthropicProvider implements LLMProvider {
       // Anthropic doesn't allow consecutive messages with the same role.
       // Merge if needed.
       const last = converted[converted.length - 1];
-      if (last && last.role === role && typeof last.content === 'string' && typeof msg.content === 'string') {
-        last.content += '\n' + msg.content;
+      if (last && last.role === role) {
+        if (typeof last.content === 'string' && typeof msg.content === 'string') {
+          last.content += '\n' + msg.content;
+        } else if (Array.isArray(last.content)) {
+          last.content.push({ type: 'text', text: msg.content });
+        } else {
+          converted.push({ role, content: msg.content });
+        }
       } else {
         converted.push({ role, content: msg.content });
       }
@@ -173,6 +182,7 @@ export class AnthropicProvider implements LLMProvider {
           'anthropic-version': '2023-06-01',
         },
         body: JSON.stringify(body),
+        signal: AbortSignal.timeout(120_000),
       });
     } catch (err: any) {
       yield { type: 'error', error: `Anthropic request failed: ${err.message}` };
@@ -189,11 +199,97 @@ export class AnthropicProvider implements LLMProvider {
     const reader = response.body!.getReader();
     const decoder = new TextDecoder();
     let buffer = '';
-    let currentToolId = '';
-    let currentToolName = '';
-    let currentToolArgs = '';
+    const activeTools = new Map<number, { id: string; name: string; arguments: string }>();
     let promptTokens = 0;
     let completionTokens = 0;
+    let emittedDone = false;
+
+    const processLine = function* (line: string): Generator<StreamChunk | { __stopError?: boolean }> {
+      const trimmed = line.trim();
+      if (!trimmed || trimmed.startsWith(':') || trimmed.startsWith('event:')) return;
+      if (!trimmed.startsWith('data:')) return;
+
+      const data = trimmed.slice(5).trimStart();
+      let parsed: any;
+      try {
+        parsed = JSON.parse(data);
+      } catch {
+        return;
+      }
+
+      switch (parsed.type) {
+        case 'message_start':
+          if (parsed.message?.usage) {
+            promptTokens = parsed.message.usage.input_tokens || 0;
+          }
+          break;
+
+        case 'content_block_start':
+          if (parsed.content_block?.type === 'tool_use') {
+            const idx = parsed.index ?? 0;
+            activeTools.set(idx, {
+              id: parsed.content_block.id || '',
+              name: parsed.content_block.name || '',
+              arguments: '',
+            });
+          }
+          break;
+
+        case 'content_block_delta':
+          if (parsed.delta?.type === 'text_delta' && parsed.delta.text) {
+            yield { type: 'text', text: parsed.delta.text };
+          } else if (parsed.delta?.type === 'input_json_delta') {
+            const idx = parsed.index ?? 0;
+            const active = activeTools.get(idx);
+            if (active) {
+              active.arguments += parsed.delta.partial_json || '';
+            }
+          }
+          break;
+
+        case 'content_block_stop': {
+          const idx = parsed.index ?? 0;
+          const active = activeTools.get(idx);
+          if (active) {
+            yield {
+              type: 'tool_call',
+              toolCall: {
+                id: active.id,
+                type: 'function',
+                function: {
+                  name: active.name,
+                  arguments: active.arguments.trim() || '{}',
+                },
+              },
+            };
+            activeTools.delete(idx);
+          }
+          break;
+        }
+
+        case 'message_delta':
+          if (parsed.usage) {
+            completionTokens = parsed.usage.output_tokens || 0;
+          }
+          break;
+
+        case 'message_stop':
+          emittedDone = true;
+          yield {
+            type: 'done',
+            usage: { promptTokens, completionTokens },
+          };
+          break;
+
+        case 'error':
+          yield {
+            type: 'error',
+            error: parsed.error?.message || 'Unknown Anthropic stream error',
+          };
+          yield { __stopError: true };
+          break;
+      }
+    };
 
     try {
       while (true) {
@@ -205,85 +301,19 @@ export class AnthropicProvider implements LLMProvider {
         buffer = lines.pop() || '';
 
         for (const line of lines) {
-          const trimmed = line.trim();
-          if (!trimmed || trimmed.startsWith(':')) continue;
-
-          if (trimmed.startsWith('event: ')) {
-            // We'll handle events by the data that follows
-            continue;
+          for (const out of processLine(line)) {
+            if ('__stopError' in out) return;
+            yield out;
           }
+        }
+      }
 
-          if (trimmed.startsWith('data: ')) {
-            const data = trimmed.slice(6);
-            let parsed: any;
-            try {
-              parsed = JSON.parse(data);
-            } catch {
-              continue;
-            }
-
-            switch (parsed.type) {
-              case 'message_start':
-                if (parsed.message?.usage) {
-                  promptTokens = parsed.message.usage.input_tokens || 0;
-                }
-                break;
-
-              case 'content_block_start':
-                if (parsed.content_block?.type === 'tool_use') {
-                  currentToolId = parsed.content_block.id || '';
-                  currentToolName = parsed.content_block.name || '';
-                  currentToolArgs = '';
-                }
-                break;
-
-              case 'content_block_delta':
-                if (parsed.delta?.type === 'text_delta') {
-                  yield { type: 'text', text: parsed.delta.text };
-                } else if (parsed.delta?.type === 'input_json_delta') {
-                  currentToolArgs += parsed.delta.partial_json || '';
-                }
-                break;
-
-              case 'content_block_stop':
-                if (currentToolId) {
-                  yield {
-                    type: 'tool_call',
-                    toolCall: {
-                      id: currentToolId,
-                      type: 'function',
-                      function: {
-                        name: currentToolName,
-                        arguments: currentToolArgs,
-                      },
-                    },
-                  };
-                  currentToolId = '';
-                  currentToolName = '';
-                  currentToolArgs = '';
-                }
-                break;
-
-              case 'message_delta':
-                if (parsed.usage) {
-                  completionTokens = parsed.usage.output_tokens || 0;
-                }
-                break;
-
-              case 'message_stop':
-                yield {
-                  type: 'done',
-                  usage: { promptTokens, completionTokens },
-                };
-                break;
-
-              case 'error':
-                yield {
-                  type: 'error',
-                  error: parsed.error?.message || 'Unknown Anthropic stream error',
-                };
-                break;
-            }
+      buffer += decoder.decode();
+      if (buffer.trim()) {
+        for (const line of buffer.split('\n')) {
+          for (const out of processLine(line)) {
+            if ('__stopError' in out) return;
+            yield out;
           }
         }
       }
@@ -291,8 +321,24 @@ export class AnthropicProvider implements LLMProvider {
       reader.releaseLock();
     }
 
-    // If we never got a message_stop event, still emit done
-    yield { type: 'done', usage: { promptTokens, completionTokens } };
+    // Flush any unclosed tool block
+    for (const [, active] of activeTools) {
+      yield {
+        type: 'tool_call',
+        toolCall: {
+          id: active.id,
+          type: 'function',
+          function: {
+            name: active.name,
+            arguments: active.arguments.trim() || '{}',
+          },
+        },
+      };
+    }
+
+    if (!emittedDone) {
+      yield { type: 'done', usage: { promptTokens, completionTokens } };
+    }
   }
 
   async listModels(): Promise<Model[]> {

@@ -1,5 +1,5 @@
 import type { LLMProvider, Model, Message, ToolDef, StreamChunk, ChatOptions } from '../provider';
-import { parseSSE } from './openai';
+import { formatOpenAIMessages, streamOpenAICompatibleChat } from './openai';
 
 export class OpenRouterProvider implements LLMProvider {
   id = 'openrouter';
@@ -54,13 +54,7 @@ export class OpenRouterProvider implements LLMProvider {
     const body: Record<string, unknown> = {
       model: this.model,
       max_tokens: options?.maxTokens ?? 4096,
-      messages: messages.map((m) => {
-        const msg: Record<string, unknown> = { role: m.role, content: m.content };
-        if (m.name) msg.name = m.name;
-        if (m.tool_calls) msg.tool_calls = m.tool_calls;
-        if (m.tool_call_id) msg.tool_call_id = m.tool_call_id;
-        return msg;
-      }),
+      messages: formatOpenAIMessages(messages),
       stream: true,
     };
     if (options?.temperature !== undefined) body.temperature = options.temperature;
@@ -77,6 +71,7 @@ export class OpenRouterProvider implements LLMProvider {
           'X-Title': 'Commandarr',
         },
         body: JSON.stringify(body),
+        signal: AbortSignal.timeout(120_000),
       });
     } catch (err: any) {
       yield { type: 'error', error: `OpenRouter request failed: ${err.message}` };
@@ -89,63 +84,7 @@ export class OpenRouterProvider implements LLMProvider {
       return;
     }
 
-    const pendingToolCalls = new Map<number, { id: string; name: string; arguments: string }>();
-
-    for await (const chunk of parseSSE(response)) {
-      const delta = chunk.choices?.[0]?.delta;
-      if (!delta) {
-        if (chunk.usage) {
-          yield {
-            type: 'done',
-            usage: {
-              promptTokens: chunk.usage.prompt_tokens || 0,
-              completionTokens: chunk.usage.completion_tokens || 0,
-            },
-          };
-        }
-        continue;
-      }
-
-      if (delta.content) {
-        yield { type: 'text', text: delta.content };
-      }
-
-      if (delta.tool_calls) {
-        for (const tc of delta.tool_calls) {
-          const idx = tc.index ?? 0;
-          if (tc.id) {
-            pendingToolCalls.set(idx, {
-              id: tc.id,
-              name: tc.function?.name || '',
-              arguments: tc.function?.arguments || '',
-            });
-          } else {
-            const existing = pendingToolCalls.get(idx);
-            if (existing) {
-              if (tc.function?.name) existing.name += tc.function.name;
-              if (tc.function?.arguments) existing.arguments += tc.function.arguments;
-            }
-          }
-        }
-      }
-
-      const finishReason = chunk.choices?.[0]?.finish_reason;
-      if (finishReason === 'tool_calls' || finishReason === 'stop') {
-        for (const [, tc] of pendingToolCalls) {
-          yield {
-            type: 'tool_call',
-            toolCall: {
-              id: tc.id,
-              type: 'function',
-              function: { name: tc.name, arguments: tc.arguments },
-            },
-          };
-        }
-        pendingToolCalls.clear();
-      }
-    }
-
-    yield { type: 'done' };
+    yield* streamOpenAICompatibleChat(response, 'OpenRouter');
   }
 
   async listModels(): Promise<Model[]> {

@@ -164,47 +164,60 @@ export async function* chatWithFallback(
     return;
   }
 
+  let lastError = 'Unknown error';
+
   for (let i = 0; i < enabledProviders.length; i++) {
     const { provider } = enabledProviders[i];
     const isLast = i === enabledProviders.length - 1;
+    let emittedOutput = false;
 
     try {
-      let hadError = false;
-      const chunks: StreamChunk[] = [];
+      let hadPreOutputError = false;
 
       for await (const chunk of provider.chat(messages, tools, options)) {
         if (chunk.type === 'error') {
+          lastError = chunk.error || `${provider.name} error`;
+          if (emittedOutput) {
+            // Once partial output has streamed, surface the error directly instead of
+            // switching providers mid-response.
+            yield chunk;
+            return;
+          }
           console.warn(
-            `[LLM Router] Provider ${provider.name} error: ${chunk.error}${isLast ? '' : ', trying next provider'}`
+            `[LLM Router] Provider ${provider.name} error: ${lastError}${isLast ? '' : ', trying next provider'}`
           );
-          hadError = true;
+          hadPreOutputError = true;
           break;
         }
-        chunks.push(chunk);
+
+        if (chunk.type === 'text' || chunk.type === 'tool_call') {
+          emittedOutput = true;
+        }
+        yield chunk;
       }
 
-      if (!hadError) {
-        // Re-yield all accumulated chunks for the successful provider
-        for (const chunk of chunks) {
-          yield chunk;
-        }
+      if (!hadPreOutputError) {
         return;
       }
 
-      // If this was the last provider and it failed, yield the error
       if (isLast) {
         yield {
           type: 'error',
-          error: `All ${enabledProviders.length} LLM providers failed. Last provider: ${provider.name}`,
+          error: enabledProviders.length > 1
+            ? `All ${enabledProviders.length} LLM providers failed. Last error (${provider.name}): ${lastError}`
+            : lastError,
         };
         return;
       }
     } catch (err: any) {
-      console.error(`[LLM Router] Provider ${provider.name} threw: ${err.message}`);
-      if (isLast) {
+      lastError = err?.message || 'Unknown error';
+      console.error(`[LLM Router] Provider ${provider.name} threw: ${lastError}`);
+      if (emittedOutput || isLast) {
         yield {
           type: 'error',
-          error: `All ${enabledProviders.length} LLM providers failed. Last error: ${err.message}`,
+          error: enabledProviders.length > 1 && !emittedOutput
+            ? `All ${enabledProviders.length} LLM providers failed. Last error (${provider.name}): ${lastError}`
+            : `${provider.name} error: ${lastError}`,
         };
         return;
       }

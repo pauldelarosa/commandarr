@@ -94,6 +94,8 @@ async function handleChatMessage(
     }
   }
 
+  let sentTerminal = false;
+
   try {
     const stream = processMessage(msg.message, conversationId, 'web');
 
@@ -103,13 +105,17 @@ async function handleChatMessage(
       } else if (chunk.type === 'tool_call' && chunk.toolCall) {
         trySend({ type: 'tool_call', toolCall: chunk.toolCall, text: chunk.text, conversationId });
       } else if (chunk.type === 'done') {
+        sentTerminal = true;
         trySend({ type: 'done', conversationId, usage: chunk.usage });
       } else if (chunk.type === 'error') {
+        sentTerminal = true;
         trySend({ type: 'error', error: chunk.error, conversationId });
       }
     }
 
-    trySend({ type: 'done', conversationId });
+    if (!sentTerminal) {
+      trySend({ type: 'done', conversationId });
+    }
   } catch (e) {
     trySend({ type: 'error', error: e instanceof Error ? e.message : 'Unknown error', conversationId });
   }
